@@ -1,6 +1,6 @@
 #!/bin/sh
 # meupkg - gerenciador minimalista (source -> pacote -> install)
-# Requisitos: curl/wget, tar, sha256sum, fakeroot, file, strip (opcional), git (para sync)
+# Reqs: curl/wget, tar, sha256sum, fakeroot, file, strip (opcional), git
 set -eu
 
 ##### CONFIG #####
@@ -10,16 +10,16 @@ BUILD_DIR="$WORK_DIR/build"             # fontes extraídas/compiladas
 SRC_DIR="$WORK_DIR/src"                 # tarballs baixados
 PKGROOT="$WORK_DIR/pkgroot"             # DESTDIR (raiz temporária por pacote)
 PKG_REPO="/var/cache/meupkg/packages"   # repositório local de pacotes binários
-STATE_DIR="/var/lib/meupkg/state"       # estado de instalados (versão/arquivos)
+STATE_DIR="/var/lib/meupkg/state"       # estado (versão/arquivos/deps)
 PKG_EXT=".tar.gz"                       # formato do pacote binário
 
 mkdir -p "$RECIPES_DIR" "$BUILD_DIR" "$SRC_DIR" "$PKGROOT" "$PKG_REPO" "$STATE_DIR"
 
-##### FLAGS E ESTADO #####
+##### FLAGS/ESTADO #####
 STRIP_BINARIES=0
+CASCADE=0               # remove dependentes automaticamente
 VISITED_PACKAGES=""
-
-##### CORES #####
+# cores
 RED="\033[1;31m"; GRN="\033[1;32m"; YLW="\033[1;33m"; BLU="\033[1;34m"; NC="\033[0m"
 msg_ok()   { printf "${GRN}[OK]${NC} %s\n" "$*"; }
 msg_warn() { printf "${YLW}[!]${NC} %s\n" "$*"; }
@@ -30,18 +30,19 @@ die()      { msg_err "$*"; exit 1; }
 ##### HELP #####
 print_usage() {
   cat <<EOF
-Uso: $0 [--strip] {build|b|install|i|remove|r|upgrade|u|sync|index|search} <pacote|termo>
+Uso: $0 [--strip] [--cascade|-c] {build|b|install|i|remove|r|upgrade|u|sync|index|search} <args>
 
-  --strip       Aplica "strip --strip-unneeded" em ELF antes de empacotar
+  --strip           Aplica strip em ELF antes de empacotar
+  --cascade, -c     Em 'remove': remove alvo + dependentes (ordem topológica)
 
 Comandos:
-  build|b       Resolve deps, compila e gera pacote binário (não instala)
-  install|i     Resolve deps e instala a versão da receita a partir do pacote local
-  remove|r      Remove pacote instalado (usa a lista de arquivos registrada)
-  upgrade|u     Rebuild + instala se a receita tiver versão mais nova
-  sync          git pull no diretório de receitas
-  index         Varre $PKG_REPO e gera $PKG_REPO/PACKAGES
-  search        Busca no PACKAGES (use um termo, ex: "$0 search nano")
+  build|b <pkg>     Resolve deps, compila e gera pacote binário (não instala)
+  install|i <pkg>   Resolve deps e instala a versão da receita
+  remove|r <pkg...> Remove pacote(s); bloqueia se houver dependentes (a menos que --cascade)
+  upgrade|u <pkg>   Rebuild + instala se a receita tiver versão mais nova
+  sync              git pull no diretório de receitas
+  index             Gera $PKG_REPO/PACKAGES a partir dos pacotes
+  search <termo>    Busca no PACKAGES
 EOF
 }
 
@@ -69,7 +70,6 @@ tar_list() {
   esac
 }
 tar_extract() {
-  # $1: arquivo, $2: destino
   mkdir -p "$2"
   case "$1" in
     *.tar.gz|*.tgz)  tar -xzf "$1" -C "$2" ;;
@@ -81,7 +81,6 @@ tar_extract() {
   esac
 }
 tar_extract_root_fakeroot() {
-  # extrai diretamente em /
   case "$1" in
     *.tar.gz|*.tgz)  fakeroot tar -xzf "$1" -C / ;;
     *.tar.xz)        fakeroot tar -xJf "$1" -C / ;;
@@ -92,7 +91,6 @@ tar_extract_root_fakeroot() {
   esac
 }
 
-# salvar/restaurar contexto (para resolver deps recursivas sem poluir variáveis)
 save_ctx() {
   SAV_NAME="${NAME-}"; SAV_VERSION="${VERSION-}"; SAV_SOURCE_URL="${SOURCE_URL-}"
   SAV_CHECKSUM="${CHECKSUM-}"; SAV_DEPENDS="${DEPENDS-}"
@@ -104,20 +102,13 @@ restore_ctx() {
 
 is_installed() { [ -f "$STATE_DIR/$1.version" ]; }
 
-##### LOADER DE RECEITA #####
-# Cada receita deve definir: NAME, VERSION, SOURCE_URL
-# Opcional: CHECKSUM (sha256), DEPENDS (lista), e hooks abaixo
+##### RECEITAS / HOOKS #####
 unset_hooks() {
   unset prepare patch_sources build check install post_install post_remove 2>/dev/null || true
 }
 define_noop_hooks() {
-  prepare() { :; }
-  patch_sources() { :; }
-  build() { :; }
-  check() { :; }
-  install() { :; }
-  post_install() { :; }
-  post_remove() { :; }
+  prepare() { :; }; patch_sources() { :; }; build() { :; }; check() { :; }
+  install() { :; }; post_install() { :; }; post_remove() { :; }
 }
 load_recipe() {
   PKG="$1"
@@ -132,7 +123,7 @@ load_recipe() {
   DEPENDS="${DEPENDS-}"; CHECKSUM="${CHECKSUM-}"
 }
 
-##### META #####
+##### META + MANIFEST #####
 write_meta() {
   META="$1/meta.txt"
   {
@@ -141,10 +132,14 @@ write_meta() {
     echo "DEPENDS=${DEPENDS-}"
   } > "$META"
 }
+write_manifest_from_tree() {
+  # Gera manifest.txt (apenas arquivos/links regulares), caminhos relativos
+  ( cd "$1" && find . -type f -o -type l | sed 's|^\./||' | sort ) > "$1/manifest.txt"
+}
 
-##### FETCH #####
+##### FETCH/BUILD/PACK #####
 pkg_fetch() {
-  msg_info "Baixando fonte de ${NAME}-${VERSION}"
+  msg_info "Baixando ${NAME}-${VERSION}"
   cd "$SRC_DIR"
   SRC_FILE="$(bn "$SOURCE_URL")"
   if [ ! -f "$SRC_FILE" ]; then
@@ -153,55 +148,45 @@ pkg_fetch() {
     msg_ok "Já existe: $SRC_FILE"
   fi
   if [ -n "${CHECKSUM-}" ]; then
-    printf "%s  %s\n" "$CHECKSUM" "$SRC_FILE" | sha256sum -c - || die "Checksum SHA256 inválido para $SRC_FILE"
+    printf "%s  %s\n" "$CHECKSUM" "$SRC_FILE" | sha256sum -c - || die "Checksum SHA256 inválido"
     msg_ok "Checksum OK"
   fi
 }
 
-##### BUILD #####
 pkg_build() {
   msg_info "Compilando ${NAME}-${VERSION}"
   SRC_FILE="$SRC_DIR/$(bn "$SOURCE_URL")"
   EXT="$(ext_from_url "$SRC_FILE")"
-  [ -n "$EXT" ] || die "Arquivo fonte não parece ser um tar suportado: $SRC_FILE"
+  [ -n "$EXT" ] || die "Fonte não é um tar suportado: $SRC_FILE"
 
-  # limpar áreas do pacote
   rm -rf "$BUILD_DIR/$NAME-$VERSION" "$PKGROOT/$NAME" 2>/dev/null || true
   mkdir -p "$BUILD_DIR/$NAME-$VERSION" "$PKGROOT/$NAME"
 
-  # extrair fonte e entrar
   tar_extract "$SRC_FILE" "$BUILD_DIR/$NAME-$VERSION"
   cd "$BUILD_DIR/$NAME-$VERSION"
 
-  # hooks pré-build
   patch_sources || true
   prepare || true
 
-  # compilar
   build
-
-  # testes (opcional)
   check || true
 
-  # instalar em DESTDIR
   export PKGDIR="$PKGROOT/$NAME"
   install
 
-  # strip opcional (somente ELF executável ou .so)
   if [ "$STRIP_BINARIES" -eq 1 ] && have strip && have file; then
-    msg_info "Aplicando strip em binários ELF…"
+    msg_info "Strip em binários ELF…"
     find "$PKGDIR" -type f -exec file {} \; \
       | grep -E 'ELF .* (executable|shared object)' \
       | cut -d: -f1 \
       | xargs -r strip --strip-unneeded 2>/dev/null || true
   fi
 
-  # meta + pacote
   write_meta "$PKGDIR"
+  write_manifest_from_tree "$PKGDIR"
   pkg_package
 }
 
-##### PACKAGE #####
 pkg_package() {
   PKG_FILE="$PKG_REPO/${NAME}-${VERSION}${PKG_EXT}"
   msg_info "Empacotando -> $PKG_FILE"
@@ -213,28 +198,123 @@ pkg_package() {
 pkg_install() {
   PKG_FILE="$PKG_REPO/${NAME}-${VERSION}${PKG_EXT}"
   if [ ! -f "$PKG_FILE" ]; then
-    msg_warn "Pacote binário não encontrado, construindo ${NAME}-${VERSION}"
+    msg_warn "Pacote binário não encontrado; construindo ${NAME}-${VERSION}"
     pkg_fetch
     pkg_build
   fi
 
-  msg_info "Instalando ${NAME}-${VERSION} a partir de $PKG_FILE"
-  # registrar lista de arquivos antes de extrair (relativos)
-  FILELIST="$STATE_DIR/$NAME.files"
-  tar_list "$PKG_FILE" > "$FILELIST"
-  # extrair em /
-  tar_extract_root_fakeroot "$PKG_FILE"
+  msg_info "Instalando ${NAME}-${VERSION}"
+  # Captura lista de arquivos a partir do pacote (manifest incluído facilita)
+  TMP=$(mktemp -d)
+  tar_extract "$PKG_FILE" "$TMP"
+
+  # Se o pacote tem manifest.txt, use-o. Caso não, derive da lista do tar.
+  if [ -f "$TMP/manifest.txt" ]; then
+    cat "$TMP/manifest.txt" > "$STATE_DIR/$NAME.files"
+  else
+    tar_list "$PKG_FILE" | grep -vE '/$' > "$STATE_DIR/$NAME.files"
+  fi
+
+  # Registra deps declaradas na instalação
+  DEPFILE="$STATE_DIR/$NAME.deps"
+  if [ -f "$TMP/meta.txt" ]; then
+    grep '^DEPENDS=' "$TMP/meta.txt" | sed 's/^DEPENDS=//' > "$DEPFILE" || echo "" > "$DEPFILE"
+  else
+    printf "%s\n" "${DEPENDS-}" > "$DEPFILE"
+  fi
+
+  # Extrai em /
+  fakeroot cp -a "$TMP"/. /
+  rm -rf "$TMP"
 
   echo "$VERSION" > "$STATE_DIR/$NAME.version"
 
-  # pós-install
   post_install || true
-
   msg_ok "${NAME}-${VERSION} instalado."
 }
 
-##### REMOVE #####
-pkg_remove() {
+##### REMOVE (limpo + reverso/topológico) #####
+installed_pkgs() { ls "$STATE_DIR"/*.version 2>/dev/null | xargs -r -n1 basename | sed 's/\.version$//' || true; }
+deps_of() { [ -f "$STATE_DIR/$1.deps" ] && tr ' ' '\n' < "$STATE_DIR/$1.deps" | sed '/^$/d' || true; }
+
+# constroi grafo: A->B (A depende de B)
+build_graph() {
+  # imprime arestas "A B" (A depende de B) para todos instalados
+  for p in $(installed_pkgs); do
+    for d in $(deps_of "$p"); do
+      echo "$p $d"
+    done
+  done
+}
+
+reverse_dependents_closure() {
+  # entrada: lista de pacotes alvo via args; saída: todos dependentes (diretos/indiretos) incluindo alvos
+  # usa mapa reverso (dep -> consumidores)
+  EDGES=$(build_graph)
+  # constrói mapa reverso em awk
+  echo "$EDGES" | awk -v targets="$*" '
+    BEGIN{
+      n=split(targets, T, " ");
+      for(i=1;i<=n;i++){ queue[T[i]]=1; }
+    }
+    { dep=$2; use=$1; rev[dep]=(dep in rev)? rev[dep]" "use : use }
+    END{
+      # BFS reverso
+      changed=1
+      while(changed){
+        changed=0
+        for (k in queue){
+          split(rev[k], L, " ")
+          for (i in L){
+            u=L[i]; if(u!="" && !(u in queue)){ queue[u]=1; changed=1 }
+          }
+        }
+      }
+      out=""
+      for (k in queue) if(k!="") out=out k " "
+      print out
+    }'
+}
+
+topo_remove_order() {
+  # entrada: conjunto S (pacotes) -> produz ordem tal que dependentes vêm antes de dependências
+  S="$*"
+  EDGES=$(build_graph | awk -v set="$S" '
+    BEGIN{
+      split(set, SS, " "); for(i in SS) if(SS[i]!="") keep[SS[i]]=1
+    }
+    { if(keep[$1] && keep[$2]) print $0 }
+  ')
+  # Kahn: deg_in = nº de dependentes "entrantes" no grafo reverso (queremos remover quem não é dependido)
+  # como aresta é A->B (A depende de B), para remoção queremos processar nós com outdegree=0 (sem dependentes em S).
+  # Implementar Kahn no grafo invertido: B->A
+  echo "$EDGES" | awk -v set="$S" '
+    BEGIN{
+      split(set, SS, " "); for(i in SS){ if(SS[i]!=""){ nodes[SS[i]]=1 } }
+    }
+    {
+      a=$1; b=$2;
+      if(a!="" && b!=""){ # invertido: b -> a
+        out[b]=(b in out)? out[b]" "a : a
+        indeg[a]++
+        nodes[a]=1; nodes[b]=1
+      }
+    }
+    END{
+      # fila = nós com indeg==0 no grafo invertido => sem dependentes no subgrafo
+      for (n in nodes) if (indeg[n]==0) q[++qend]=n
+      while(qstart<qend){
+        n=q[++qstart]; print n
+        split(out[n], L, " ")
+        for (i in L){
+          m=L[i]; if(m=="") continue
+          indeg[m]--; if(indeg[m]==0) q[++qend]=m
+        }
+      }
+    }'
+}
+
+pkg_remove_clean() {
   PKG="$1"
   VERFILE="$STATE_DIR/$PKG.version"
   FILELIST="$STATE_DIR/$PKG.files"
@@ -242,116 +322,121 @@ pkg_remove() {
   [ -f "$VERFILE" ] || die "$PKG não está instalado."
   VERSION="$(cat "$VERFILE")"
 
-  # carrega receita (se existir) para hook post_remove
-  if [ -f "$RECIPES_DIR/$PKG.sh" ]; then
-    load_recipe "$PKG"
-  else
-    NAME="$PKG"
-  fi
+  # carregar receita (se existir) para hook post_remove
+  if [ -f "$RECIPES_DIR/$PKG.sh" ]; then load_recipe "$PKG"; else NAME="$PKG"; fi
 
   msg_info "Removendo ${PKG}-${VERSION}"
 
-  # remove arquivos listados
   if [ -f "$FILELIST" ]; then
-    # remover arquivos; ignorar se já não existirem
+    # remover arquivos (ignora ausentes)
     while IFS= read -r rel; do
       [ -n "$rel" ] || continue
       f="/$rel"
-      [ -f "$f" ] && rm -f "$f" || true
-      # não remove diretórios aqui; faremos limpeza depois
+      [ -f "$f" ] && rm -f "$f" || [ -L "$f" ] && rm -f "$f" || true
     done < "$FILELIST"
 
-    # tentativa de limpeza de diretórios vazios (best-effort)
-    # varre diretórios que podem ter sido criados pelo pacote
+    # limpeza best-effort de diretórios vazios
     awk -F/ 'NF>1{ $NF=""; print "/"$0 }' OFS=/ "$FILELIST" \
-      | sed 's:/*$::' \
-      | sort -u -r \
-      | while read -r d; do
-          [ -d "$d" ] && rmdir "$d" 2>/dev/null || true
-        done
+      | sed 's:/*$::' | sort -u -r \
+      | while read -r d; do [ -d "$d" ] && rmdir "$d" 2>/dev/null || true; done
   else
-    msg_warn "Sem lista de arquivos ($FILELIST); nada para deletar."
+    msg_warn "Sem manifest ($FILELIST). Nenhum arquivo deletado."
   fi
 
-  # hooks
   post_remove || true
 
-  # limpar estado
-  rm -f "$VERFILE" "$FILELIST"
-
+  rm -f "$STATE_DIR/$PKG.version" "$STATE_DIR/$PKG.files" "$STATE_DIR/$PKG.deps"
   msg_ok "${PKG}-${VERSION} removido."
 }
 
-##### DEPENDÊNCIAS (recursivo + ciclo) #####
+cmd_remove() {
+  # aceita 1..N pacotes
+  [ $# -ge 1 ] || die "Informe ao menos um pacote para remover"
+  TARGETS="$*"
+
+  if [ $CASCADE -eq 0 ] && [ $# -eq 1 ]; then
+    # remoção simples com bloqueio se houver dependentes
+    T="$1"
+    # calcula dependentes diretos/indiretos instalados (exclui o próprio)
+    CLOSURE=$(reverse_dependents_closure "$T" | tr ' ' '\n' | grep -v "^$" | grep -v "^$T$" || true)
+    if [ -n "${CLOSURE-}" ]; then
+      msg_err "Não é possível remover '$T' — pacotes dependem dele:"
+      echo "$CLOSURE" | sed 's/^/  - /'
+      echo "Use --cascade para remover também os dependentes acima (ordem segura)."
+      exit 1
+    fi
+    # seguro, remover só T
+    pkg_remove_clean "$T"
+    return 0
+  fi
+
+  # CASCADE (ou vários pacotes): construir conjunto total e ordenar
+  # 1) inicia com TARGETS; 2) adiciona dependentes reversos (fecho) se CASCADE=1
+  if [ $CASCADE -eq 1 ]; then
+    ALL=$(reverse_dependents_closure $TARGETS)
+  else
+    # sem cascade mas múltiplos alvos: ainda precisamos ordem topológica entre eles por segurança
+    ALL="$TARGETS"
+  fi
+
+  # filtra apenas instalados
+  INST=$(installed_pkgs)
+  # intersect
+  SET=""
+  for p in $ALL; do
+    echo "$INST" | grep -qx "$p" && SET="$SET $p" || true
+  done
+  [ -n "${SET# }" ] || { msg_warn "Nenhum dos pacotes informados está instalado."; exit 0; }
+
+  ORDER=$(topo_remove_order $SET)
+
+  # ORDER pode não conter todos (se algum isolado sem arestas). Completar.
+  for p in $SET; do echo "$ORDER" | grep -qx "$p" || ORDER="$p
+$ORDER"; done
+
+  msg_info "Ordem de remoção (dependentes → dependências):"
+  echo "$ORDER" | awk 'NF{print "  - "$0}'
+
+  for p in $ORDER; do pkg_remove_clean "$p"; done
+}
+
+##### DEPENDÊNCIAS (build/install) #####
 resolve_deps_recursive() {
   CUR="$NAME"
-
-  # ciclo?
   echo " $VISITED_PACKAGES " | grep -qw " $CUR " && die "Ciclo de dependências detectado em: $CUR"
   VISITED_PACKAGES="$VISITED_PACKAGES $CUR"
-
   [ -n "${DEPENDS-}" ] || return 0
-
   for dep in $DEPENDS; do
-    if is_installed "$dep"; then
-      msg_ok "Dependência já instalada: $dep"
-      continue
-    fi
-
-    # carregar receita da dependência
-    save_ctx
-    load_recipe "$dep"
-
-    # recursão
-    resolve_deps_recursive
-
-    # compilar/instalar a dependência
-    pkg_fetch
-    pkg_build
-    pkg_install
-
-    # voltar ao contexto do pacote chamador
-    restore_ctx
+    if is_installed "$dep"; then msg_ok "Dep já instalada: $dep"; continue; fi
+    save_ctx; load_recipe "$dep"; resolve_deps_recursive; pkg_fetch; pkg_build; pkg_install; restore_ctx
   done
 }
 
-##### UPGRADE #####
+##### UPGRADE / SYNC / INDEX / SEARCH #####
 cmd_upgrade() {
   PKG="$1"
   load_recipe "$PKG"
   if is_installed "$PKG"; then
     CUR="$(cat "$STATE_DIR/$PKG.version")"
-    if [ "$CUR" = "$VERSION" ]; then
-      msg_ok "$PKG já está na versão $CUR"
-      return 0
-    fi
+    [ "$CUR" = "$VERSION" ] && { msg_ok "$PKG já na versão $CUR"; return 0; }
     msg_info "Upgrade: $PKG $CUR -> $VERSION"
   else
-    msg_info "$PKG não está instalado; será instalado."
+    msg_info "$PKG não instalado; será instalado."
   fi
-  VISITED_PACKAGES=""
-  resolve_deps_recursive
-  pkg_fetch
-  pkg_build
-  pkg_install
+  VISITED_PACKAGES=""; resolve_deps_recursive; pkg_fetch; pkg_build; pkg_install
 }
-
-##### SYNC (git pull) #####
 cmd_sync() {
   [ -d "$RECIPES_DIR/.git" ] || die "$RECIPES_DIR não é um repositório git"
   msg_info "Sincronizando receitas (git pull)…"
   (cd "$RECIPES_DIR" && git pull --ff-only)
   msg_ok "Receitas atualizadas."
 }
-
-##### INDEX #####
 cmd_index() {
   INDEX_FILE="$PKG_REPO/PACKAGES"
   : > "$INDEX_FILE"
   for pkg in "$PKG_REPO"/*$PKG_EXT; do
     [ -f "$pkg" ] || continue
     TMP=$(mktemp -d)
-    # extrai apenas meta.txt
     tar_extract "$pkg" "$TMP"
     if [ -f "$TMP/meta.txt" ]; then
       echo "---" >> "$INDEX_FILE"
@@ -362,13 +447,9 @@ cmd_index() {
   done
   msg_ok "INDEX gerado: $INDEX_FILE"
 }
-
-##### SEARCH #####
 cmd_search() {
-  TERM="${1-}"
-  [ -n "$TERM" ] || die "Informe um termo. Ex: $0 search nano"
-  INDEX_FILE="$PKG_REPO/PACKAGES"
-  [ -f "$INDEX_FILE" ] || die "Nenhum INDEX encontrado. Rode: $0 index"
+  TERM="${1-}"; [ -n "$TERM" ] || die "Informe um termo. Ex: $0 search nano"
+  INDEX_FILE="$PKG_REPO/PACKAGES"; [ -f "$INDEX_FILE" ] || die "Nenhum INDEX. Rode: $0 index"
   awk -v term="$TERM" -v GRN="$GRN" -v NC="$NC" '
     BEGIN { RS="---"; IGNORECASE=1 }
     {
@@ -390,44 +471,34 @@ cmd_search() {
 }
 
 ##### PARSE CLI #####
-# flags
+# flags globais
 while [ "${1-}" ]; do
   case "$1" in
     --strip) STRIP_BINARIES=1; shift ;;
+    --cascade|-c) CASCADE=1; shift ;;
     -h|--help) print_usage; exit 0 ;;
     build|b|install|i|remove|r|upgrade|u|sync|index|search) break ;;
     *) break ;;
   esac
 done
 
-ACTION="${1-}"
-ARG="${2-}"
-
-[ -n "$ACTION" ] || { print_usage; exit 1; }
-
-case "$ACTION" in
+ACTION="${1-}"; shift || true
+case "${ACTION-}" in
   build|b)
-    [ -n "$ARG" ] || die "Informe o nome do pacote"
-    load_recipe "$ARG"
-    VISITED_PACKAGES=""
-    resolve_deps_recursive
-    pkg_fetch
-    pkg_build
+    PKG="${1-}"; [ -n "$PKG" ] || die "Informe o pacote"
+    load_recipe "$PKG"; VISITED_PACKAGES=""; resolve_deps_recursive; pkg_fetch; pkg_build
     ;;
   install|i)
-    [ -n "$ARG" ] || die "Informe o nome do pacote"
-    load_recipe "$ARG"
-    VISITED_PACKAGES=""
-    resolve_deps_recursive
-    pkg_install
+    PKG="${1-}"; [ -n "$PKG" ] || die "Informe o pacote"
+    load_recipe "$PKG"; VISITED_PACKAGES=""; resolve_deps_recursive; pkg_install
     ;;
   remove|r)
-    [ -n "$ARG" ] || die "Informe o nome do pacote"
-    pkg_remove "$ARG"
+    [ $# -ge 1 ] || die "Informe ao menos um pacote para remover"
+    cmd_remove "$@"
     ;;
   upgrade|u)
-    [ -n "$ARG" ] || die "Informe o nome do pacote"
-    cmd_upgrade "$ARG"
+    PKG="${1-}"; [ -n "$PKG" ] || die "Informe o pacote"
+    cmd_upgrade "$PKG"
     ;;
   sync)
     cmd_sync
@@ -436,9 +507,8 @@ case "$ACTION" in
     cmd_index
     ;;
   search)
-    [ -n "$ARG" ] || die "Informe o termo de busca"
-    cmd_search "$ARG"
+    TERM="${1-}"; [ -n "$TERM" ] || die "Informe o termo de busca"
+    cmd_search "$TERM"
     ;;
-  *)
-    print_usage; exit 1 ;;
+  *) print_usage; exit 1 ;;
 esac
