@@ -1,0 +1,2 @@
+# meupkg
+Gerenciador de programas 
