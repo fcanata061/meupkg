@@ -53,19 +53,28 @@ pkg_build() {
     export PKGDIR="$PKG_TMPDIR"
     rm -rf "$PKGDIR"/*
     mkdir -p "$PKGDIR"
+
+    # Se existir patch_sources na receita → executa
+    type patch_sources >/dev/null 2>&1 && patch_sources
+
     build
+
+    # Se existir check na receita → executa
+    type check >/dev/null 2>&1 && check
 }
 
 pkg_install() {
     echo "[*] Instalando $NAME"
     cd "$BUILD_DIR/$NAME-$VERSION" || exit 1
     install
-
     cp -rv "$PKGDIR"/* /
 
     # Registro
     find "$PKGDIR" -type f > "$LOG_DIR/$NAME.files"
     echo "$VERSION" > "$LOG_DIR/$NAME.version"
+
+    # Se existir post_install → executa
+    type post_install >/dev/null 2>&1 && post_install
 
     echo "[OK] $NAME-$VERSION instalado!"
 }
@@ -80,6 +89,10 @@ pkg_remove() {
         [ -f "$file" ] && rm -v "$file"
     done < "$LOG_DIR/$PKG_NAME.files"
     rm -f "$LOG_DIR/$PKG_NAME.files" "$LOG_DIR/$PKG_NAME.version"
+
+    # Se existir post_remove → executa
+    type post_remove >/dev/null 2>&1 && post_remove
+
     echo "[OK] $PKG_NAME removido!"
 }
 
